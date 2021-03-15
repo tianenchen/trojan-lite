@@ -1,0 +1,45 @@
+syntax = "proto3";
+package api;
+
+message User {
+    string pswd = 1;
+    uint64 upload = 2;
+    uint64 download = 3;
+}
+
+message ListUsersRequest{}
+
+message ListUsersResponse {
+    User user = 1;
+}
+
+message GetUserRequest {
+    string pswd = 1;
+}
+
+message GetUserResponse{
+    User user = 1;
+}
+
+message UpsertUserRequest {
+    User user = 1;
+}
+
+message RemoveUserRequest {
+    string pswd = 1;
+}
+
+message SetUserResponse {
+    bool success = 1;
+}
+
+service UserManagement {
+    // list all users
+    rpc ListUsers(ListUsersRequest) returns(stream ListUsersResponse){}
+    // obtain specified user's info
+    rpc GetUser(GetUserRequest) returns(GetUserResponse){}
+    // setup exsisting users' config
+    rpc UpsertUser(UpsertUserRequest) returns(SetUserResponse){}
+
+    rpc RemoveUser(RemoveUserRequest) returns(SetUserResponse){}
+}
