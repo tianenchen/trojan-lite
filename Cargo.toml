@@ -3,6 +3,12 @@ name = "trojan-lite"
 version = "0.1.0"
 authors = ["tianenchen <cteeye@gmail.com>"]
 edition = "2018"
+readme = "README.md"
+license = "Apache-2.0"
+license-file = "LICENSE"
+description = "A lightweight troajn protocol implementation"
+documentation = "https://docs.rs/trojan-lite"
+repository = "https://github.com/tianenchen/trojan-lite"
 
 [features]
 default = ["multi-threaded"]
@@ -37,7 +43,7 @@ hex = "0.4"
 tonic-build = { version = "0.4", features = ["prost"] }
 
 [[bin]]
-name = "trojan-server"
+name = "trojan-lite-server"
 path = "src/bin/server.rs"
 
 [[bin]]
