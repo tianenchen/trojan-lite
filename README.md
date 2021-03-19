@@ -2,8 +2,8 @@
 
 Trojan-lite is a lightweight Troajn protocol implementation. At the same time it is my personal network programming practice. It has these properties:
 
-- TCP and UDP supported
-- Ipv4 and Ipv6 supported
+- TCP and UDP are supported
+- Ipv4 and Ipv6 are supported
 - DoT(DNS over TLS)
 - user management API
 
