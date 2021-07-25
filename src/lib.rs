@@ -1,10 +1,10 @@
 #[macro_use]
 extern crate log;
 
-mod copy_bidirectional;
 mod forward;
 mod header;
 mod resolver;
+#[cfg(feature = "user-management")]
 mod usermg;
 use std::{
     collections::HashMap,
@@ -17,11 +17,10 @@ use std::{
 
 use sha2::Digest;
 
-use usermg::User;
-
 use thiserror::Error;
-use tokio::{net::UdpSocket, runtime, sync::RwLock, try_join};
+use tokio::{net::UdpSocket, runtime, sync::RwLock};
 
+#[cfg(feature = "dns-over-tls")]
 use trust_dns_resolver::{
     config::{ResolverConfig, ResolverOpts},
     TokioAsyncResolver,
@@ -39,18 +38,26 @@ pub const DEFAULT_BUFFER_SIZE: usize = 2 * 4096;
 pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[cfg(feature = "user-management")]
     #[error("transport error: {0}")]
     Transport(#[from] tonic::transport::Error),
-    #[error("resolve error: {0}")]
-    Resolve(#[from] trust_dns_resolver::error::ResolveError),
-    #[error("{0}")]
-    Elapsed(#[from] tokio::time::error::Elapsed),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 fn load_certs(path: &Path) -> io::Result<Vec<Certificate>> {
     certs(&mut BufReader::new(File::open(path)?))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid cert"))
+}
+
+#[cfg(feature = "user-management")]
+pub use usermg::User;
+
+#[cfg(not(feature = "user-management"))]
+#[derive(Clone, PartialEq)]
+pub struct User {
+    pub pswd: String,
+    pub upload: u64,
+    pub download: u64,
 }
 
 macro_rules! key {
@@ -106,28 +113,15 @@ pub fn hex_hash(content: &str) -> Box<[u8]> {
         .unwrap_or_default();
     Box::new(bytes)
 }
- 
-/// Run trojan server.
-///
-/// `addr` the address of trojan server binding
-/// `mng_addr` the address of user management service binding
-/// `cert` the path of certificates 
-/// `key` the path of private key
-/// `auth` enable client authentication with a specified certificate
-/// `require_auth` is require client authentication
-/// `users` available users
-///
-/// ## Example
-///
-/// See /src/bin/server for an example.
+
 pub fn run_server(
     addr: SocketAddr,
-    mng_addr: Option<SocketAddr>,
     cert: PathBuf,
     key: PathBuf,
     auth: Option<PathBuf>,
     require_auth: bool,
     users: Vec<String>,
+    #[cfg(feature = "user-management")] mng_addr: Option<SocketAddr>,
     #[cfg(feature = "multi-threaded")] threads: Option<usize>,
 ) -> Result<()> {
     let certs = load_certs(&cert)?;
@@ -152,7 +146,9 @@ pub fn run_server(
         .set_single_cert(certs, key)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let users: Arc<RwLock<HashMap<Box<[u8]>, User>>> = users!(users);
-    let resolver = TokioAsyncResolver::tokio(ResolverConfig::google(), ResolverOpts::default())?;
+    #[cfg(feature = "dns-over-tls")]
+    let resolver = TokioAsyncResolver::tokio(ResolverConfig::google(), ResolverOpts::default())
+        .expect("build 'TokioAsyncResolver' fail");
     #[cfg(feature = "multi-threaded")]
     let mut builder = {
         let mut builder = runtime::Builder::new_multi_thread();
@@ -172,16 +168,24 @@ pub fn run_server(
             0,
         )))
         .await?;
-        let forwarder =
-            forward::Forwarder::new(users.clone(), Arc::new(resolver), Arc::new(udp_socket));
+        // let udp_socket = UdpSocket::from_std(socket.into_udp_socket())?;
+        debug!("udp socket bind: {}", udp_socket.local_addr().unwrap());
+        let forwarder = forward::Forwarder::new(
+            users.clone(),
+            #[cfg(feature = "dns-over-tls")]
+            Arc::new(resolver),
+            Arc::new(udp_socket),
+        );
         let forwarder_fut = forwarder.run_server(addr, config);
+        #[cfg(feature = "user-management")]
         if let Some(mng_addr) = mng_addr {
-            // enable user mananage service
             let mngsvr_fut = usermg::run_server(mng_addr, users);
-            try_join!(forwarder_fut, mngsvr_fut).map(|_| ())
+            tokio::try_join!(forwarder_fut, mngsvr_fut).map(|_| ())
         } else {
             forwarder_fut.await
         }
+        #[cfg(not(feature = "user-management"))]
+        forwarder_fut.await
     })?;
     Ok(())
 }

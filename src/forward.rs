@@ -1,6 +1,6 @@
 use bytes::{Buf, BytesMut};
 use tokio::{
-    io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
+    io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf,copy_bidirectional},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{Mutex, RwLock},
 };
@@ -13,18 +13,19 @@ use tokio_util::codec::Decoder;
 use socket2::{Domain, Socket, Type};
 
 use crate::{
-    copy_bidirectional::copy_bidirectional,
-    header::{MaybeSocketAddr, TrojanDecoder, UdpAssociate, UdpAssociateDecoder},
-    usermg::User,
-    Error, Result, DEFAULT_BUFFER_SIZE,
+    header::{TrojanDecoder, UdpAssociate, UdpAssociateDecoder},
+    Error, Result, User, DEFAULT_BUFFER_SIZE,
 };
 use std::{
     collections::HashMap,
-    io::{Error as IoError, Result as IoResult},
+    io::{Error as IoError, ErrorKind as IoErrorKind, Result as IoResult},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::Arc,
 };
 
+use crate::resolver::resolve;
+
+#[cfg(feature = "dns-over-tls")]
 use trust_dns_resolver::TokioAsyncResolver;
 
 use once_cell::sync::Lazy;
@@ -34,7 +35,6 @@ type TlsStream = RustlsStream<TcpStream>;
 static UNSPECIFIED: Lazy<SocketAddr> =
     Lazy::new(|| SocketAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
 
-/// send a bad request to `$s` and close it immediately.
 macro_rules! bad_request {
     ($s:ident) => {
         $s.write_all(b"HTTP/1.1 400 bad request\r\nconnection: closed\r\n\r\nbad request")
@@ -44,41 +44,45 @@ macro_rules! bad_request {
     };
 }
 
+#[cfg(feature = "dns-over-tls")]
 macro_rules! resolve {
     ($addr:expr,$resolver:expr) => {
-        match $addr {
-            MaybeSocketAddr::SocketAddr(ref addr) => *addr,
-            MaybeSocketAddr::HostAndPort(host, port) => {
-                crate::resolver::resolve(host.clone(), *port, $resolver)
-                    .await?
-                    .ok_or(trust_dns_resolver::error::ResolveError::from(format!(
-                        "no addresses returned ,host: {}",
-                        host
-                    )))?
-            }
-        }
+        resolve($addr, $resolver)
+            .await?
+            .ok_or(Error::Io(std::io::Error::new(
+                IoErrorKind::AddrNotAvailable,
+                format!("no addresses returned ,host: {}", $addr),
+            )))?
+    };
+}
+
+#[cfg(not(feature = "dns-over-tls"))]
+macro_rules! resolve {
+    ($addr:expr) => {
+        resolve($addr)?.ok_or(Error::Io(std::io::Error::new(
+            IoErrorKind::AddrNotAvailable,
+            format!("no addresses returned ,host: {}", $addr),
+        )))?
     };
 }
 
 pub struct Forwarder {
-    /// available users
     users: Arc<RwLock<HashMap<Box<[u8]>, User>>>,
-    /// tokio DNS resolver
+    #[cfg(feature = "dns-over-tls")]
     resolver: Arc<TokioAsyncResolver>,
-    /// common UDP socket
     udp_socket: Arc<UdpSocket>,
-    /// current exchanging UDP group
     udp_pairs: Arc<Mutex<HashMap<SocketAddrV6, (WriteHalf<TlsStream>, u64)>>>,
 }
 
 impl Forwarder {
     pub fn new(
         users: Arc<RwLock<HashMap<Box<[u8]>, User>>>,
-        resolver: Arc<TokioAsyncResolver>,
+        #[cfg(feature = "dns-over-tls")] resolver: Arc<TokioAsyncResolver>,
         udp_socket: Arc<UdpSocket>,
     ) -> Self {
         Forwarder {
             users,
+            #[cfg(feature = "dns-over-tls")]
             resolver,
             udp_socket,
             udp_pairs: Default::default(),
@@ -100,6 +104,7 @@ impl Forwarder {
         socket.set_read_timeout(Some(Duration::from_secs(60)))?;
         socket.set_write_timeout(Some(Duration::from_secs(60)))?;
         socket.set_linger(Some(Duration::from_secs(10)))?;
+        socket.set_keepalive(Some(Duration::from_secs(60)))?;
         socket.bind(&ipv6.into())?;
         socket.listen(128)?;
         let listener = TcpListener::from_std(socket.into_tcp_listener())?;
@@ -110,6 +115,7 @@ impl Forwarder {
                 inbound,
                 acceptor.clone(),
                 self.users.clone(),
+                #[cfg(feature = "dns-over-tls")]
                 self.resolver.clone(),
                 self.udp_socket.clone(),
                 self.udp_pairs.clone(),
@@ -121,6 +127,33 @@ impl Forwarder {
             });
         }
         Ok(())
+    }
+}
+
+async fn udp_transfer_to_downstream(
+    udp_socket: Arc<UdpSocket>,
+    udp_pairs: Arc<Mutex<HashMap<SocketAddrV6, (WriteHalf<TlsStream>, u64)>>>,
+) -> IoResult<()> {
+    let mut buf = vec![0; 2048].into_boxed_slice();
+    loop {
+        let (len, dst) = udp_socket.recv_from(&mut buf).await?;
+        let us: Vec<u8> = UdpAssociate::new(dst, &buf[..len]).into();
+        {
+            let mut is_err = false;
+            let mut guard = udp_pairs.lock().await;
+            let dst = to_ipv6_address(&dst);
+            if let Some((write_half, download)) = guard.get_mut(&dst) {
+                if let Err(e) = write_half.write_all(&us).await {
+                    error!("udp transfer to downstream error: {}", e);
+                    is_err = true;
+                } else {
+                    *download += len as u64;
+                }
+            }
+            if is_err {
+                guard.remove(&dst);
+            }
+        }
     }
 }
 
@@ -137,7 +170,7 @@ async fn transfer(
     inbound: TcpStream,
     acceptor: TlsAcceptor,
     users: Arc<RwLock<HashMap<Box<[u8]>, User>>>,
-    resolver: Arc<TokioAsyncResolver>,
+    #[cfg(feature = "dns-over-tls")] resolver: Arc<TokioAsyncResolver>,
     udp_socket: Arc<UdpSocket>,
     udp_pairs: Arc<Mutex<HashMap<SocketAddrV6, (WriteHalf<TlsStream>, u64)>>>,
 ) -> Result<()> {
@@ -174,7 +207,10 @@ async fn transfer(
                     bad_request!(stream);
                     break;
                 }
+                #[cfg(feature = "dns-over-tls")]
                 let addr = resolve!(&header.addr, resolver.clone());
+                #[cfg(not(feature = "dns-over-tls"))]
+                let addr = resolve!(&header.addr);
                 let (upload, download) = if header.udp_associate {
                     let (read_half, write_half) = split(stream);
                     let cached = {
@@ -192,11 +228,25 @@ async fn transfer(
                         }
                     };
                     if let Some(write_half) = cached {
-                        udp_bitransfer(src, read_half, write_half, buf, resolver).await?
+                        udp_bitransfer(
+                            src,
+                            read_half,
+                            write_half,
+                            buf,
+                            #[cfg(feature = "dns-over-tls")]
+                            resolver,
+                        )
+                        .await?
                     } else {
-                        let upload =
-                            udp_transfer_to_upstream(read_half, addr, udp_socket, buf, resolver)
-                                .await;
+                        let upload = udp_transfer_to_upstream(
+                            read_half,
+                            addr,
+                            udp_socket,
+                            buf,
+                            #[cfg(feature = "dns-over-tls")]
+                            resolver,
+                        )
+                        .await;
                         let mut guard = udp_pairs.lock().await;
                         let addr = to_ipv6_address(&addr);
                         let pair = guard.remove(&addr);
@@ -219,6 +269,7 @@ async fn transfer(
                     socket.set_read_timeout(Some(Duration::from_secs(60)))?;
                     socket.set_write_timeout(Some(Duration::from_secs(60)))?;
                     socket.set_linger(Some(Duration::from_secs(10)))?;
+                    socket.set_keepalive(Some(Duration::from_secs(60)))?;
                     socket.connect_timeout(&addr.into(), Duration::from_secs(5))?;
                     socket.set_nonblocking(true)?;
                     let outbound = TcpStream::from_std(socket.into_tcp_stream())?;
@@ -253,18 +304,27 @@ async fn udp_transfer_to_upstream(
     addr: SocketAddr,
     outbound: Arc<UdpSocket>,
     mut buf: BytesMut,
-    resolver: Arc<TokioAsyncResolver>,
+    #[cfg(feature = "dns-over-tls")] resolver: Arc<TokioAsyncResolver>,
 ) -> Result<u64> {
     let mut upload = 0;
     loop {
         while let Some(frame) = UdpAssociateDecoder.decode(&mut buf)? {
-            let addr = resolve!(&frame.addr, resolver.clone());
+            #[cfg(feature = "dns-over-tls")]
+            let addr = {
+                let resolver = resolver.clone();
+                resolve!(&frame.addr, resolver)
+            };
+            #[cfg(not(feature = "dns-over-tls"))]
+            let addr = resolve!(&frame.addr);
             upload += outbound.send_to(&frame.payload, addr).await?;
         }
         if let Ok(r) = timeout(Duration::from_secs(60), inbound.read_buf(&mut buf)).await {
             if r? == 0 {
                 while let Some(frame) = UdpAssociateDecoder.decode_eof(&mut buf)? {
+                    #[cfg(feature = "dns-over-tls")]
                     let addr = resolve!(&frame.addr, resolver.clone());
+                    #[cfg(not(feature = "dns-over-tls"))]
+                    let addr = resolve!(&frame.addr);
                     upload += outbound.send_to(&frame.payload, addr).await?;
                 }
                 break;
@@ -277,40 +337,12 @@ async fn udp_transfer_to_upstream(
     Ok(upload as u64)
 }
 
-async fn udp_transfer_to_downstream(
-    udp_socket: Arc<UdpSocket>,
-    udp_pairs: Arc<Mutex<HashMap<SocketAddrV6, (WriteHalf<TlsStream>, u64)>>>,
-) -> IoResult<()> {
-    let mut buf = vec![0; 2048].into_boxed_slice();
-    loop {
-        let (len, dst) = udp_socket.recv_from(&mut buf).await?;
-        let us: Vec<u8> = UdpAssociate::new(dst, &buf[..len]).into();
-        {
-            let mut is_err = false;
-            let mut guard = udp_pairs.lock().await;
-            let dst = to_ipv6_address(&dst);
-            if let Some((write_half, download)) = guard.get_mut(&dst) {
-                if let Err(e) = write_half.write_all(&us).await {
-                    error!("udp transfer to downstream error: {}", e);
-                    is_err = true;
-                } else {
-                    *download += len as u64;
-                }
-            }
-            if is_err {
-                guard.remove(&dst);
-            }
-        }
-    }
-}
-
-/// UDP bi-directional transmission through two futures
 async fn udp_bitransfer(
     src: SocketAddr,
     mut ri: ReadHalf<TlsStream>,
     mut wi: WriteHalf<TlsStream>,
     mut buf: BytesMut,
-    resolver: Arc<TokioAsyncResolver>,
+    #[cfg(feature = "dns-over-tls")] resolver: Arc<TokioAsyncResolver>,
 ) -> Result<(u64, u64)> {
     let (mut upload, mut download) = (0, 0);
     let outbound = UdpSocket::bind(SocketAddr::from(SocketAddrV6::new(
@@ -323,13 +355,19 @@ async fn udp_bitransfer(
     let client_to_server = async {
         loop {
             while let Some(frame) = UdpAssociateDecoder.decode(&mut buf)? {
+                #[cfg(feature = "dns-over-tls")]
                 let addr = resolve!(&frame.addr, resolver.clone());
+                #[cfg(not(feature = "dns-over-tls"))]
+                let addr = resolve!(&frame.addr);
                 upload += outbound.send_to(&frame.payload, addr).await?;
             }
             if let Ok(r) = timeout(Duration::from_secs(60), ri.read_buf(&mut buf)).await {
                 if r? == 0 {
                     while let Some(frame) = UdpAssociateDecoder.decode_eof(&mut buf)? {
+                        #[cfg(feature = "dns-over-tls")]
                         let addr = resolve!(&frame.addr, resolver.clone());
+                        #[cfg(not(feature = "dns-over-tls"))]
+                        let addr = resolve!(&frame.addr);
                         upload += outbound.send_to(&frame.payload, addr).await?;
                     }
                     break;
@@ -374,7 +412,6 @@ async fn tcp_bitransfer(
 ) -> IoResult<(u64, u64)> {
     let remaining = buf.remaining();
     if remaining > 0 {
-        // flushing remaining buffer
         outbound.write_all(buf.chunk()).await?;
     }
     let (upload, download) = copy_bidirectional(&mut inbound, &mut outbound).await?;

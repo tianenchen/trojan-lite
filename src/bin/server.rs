@@ -13,6 +13,7 @@ struct Options {
     addr: SocketAddr,
 
     /// user management service bind addr
+    #[cfg(feature = "user-management")]
     #[argh(option, short = 'm')]
     mng_addr: Option<SocketAddr>,
 
@@ -47,7 +48,6 @@ fn main() {
     let opts: Options = argh::from_env();
     let Options {
         addr,
-        mng_addr,
         cert,
         key,
         auth,
@@ -57,12 +57,13 @@ fn main() {
     } = opts;
     if let Err(e) = trojan_lite::run_server(
         addr,
-        mng_addr,
         cert,
         key,
         auth,
         require_auth,
         users,
+        #[cfg(feature = "user-management")]
+        opts.mng_addr,
         #[cfg(feature = "multi-threaded")]
         opts.threads,
     ) {

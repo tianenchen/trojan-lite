@@ -1,5 +1,5 @@
 mod pb {
-    include!("../proto/output/api.rs");
+    include!("../protocol/api.rs");
 }
 
 pub use pb::User;

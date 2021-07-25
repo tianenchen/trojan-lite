@@ -1,3 +1,4 @@
+
 use std::{
     io,
     net::SocketAddr,
@@ -35,11 +36,11 @@ struct Options {
     #[argh(positional)]
     trojan_server_addr: SocketAddr,
 
-    /// user management service bind addr
+    /// thread
     #[argh(option, short = 't', default = "4")]
     thread: u8,
 
-    /// user
+    /// test user
     #[argh(option, short = 'u')]
     user: String,
 }
@@ -163,10 +164,10 @@ async fn main() {
     let start = std::time::Instant::now();
     loop {
         slepper.await;
-        let i = amt.load(Ordering::SeqCst) as f32;
+        let i = amt.load(Ordering::SeqCst);
         println!(
             "{}M/s",
-            i / 1024_f32 / 1024_f32 / start.elapsed().as_secs() as f32
+            i / 1024 / 1024 / start.elapsed().as_secs() as usize
         );
         slepper = tokio::time::sleep(std::time::Duration::from_secs(1));
     }

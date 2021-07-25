@@ -1,6 +1,6 @@
 [package]
 name = "trojan-lite"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["tianenchen <cteeye@gmail.com>"]
 edition = "2018"
 readme = "README.md"
@@ -10,16 +10,25 @@ description = "A lightweight troajn protocol implementation"
 documentation = "https://docs.rs/trojan-lite"
 repository = "https://github.com/tianenchen/trojan-lite"
 
+
 [features]
 default = ["multi-threaded"]
 
 multi-threaded = ["tokio/rt-multi-thread"]
 
-perf = ["tokio-rustls/dangerous_configuration"]
+perf = ["tokio-rustls/dangerous_configuration","futures"]
 
+dns-over-tls = ["trust-dns-resolver"]
+
+user-management = [
+    "tonic",
+    "prost",
+    "futures",
+    "tonic-build",
+]
 
 [dependencies]
-tokio = { version = "1.2" , features = ["net","io-util","rt","macros"] }
+tokio = { version = "1.9" , features = ["net","time","io-util","rt","macros"] }
 tokio-util = { version = "0.6" , features = ["codec"]}
 tokio-rustls =  "0.22"
 bytes = "1.0"
@@ -31,16 +40,17 @@ once_cell = "1.5"
 
 socket2 = "0.3"
 
-trust-dns-resolver = { version = "0.20" , features = ["dns-over-rustls"] }
+trust-dns-resolver = { version = "0.20" , features = ["dns-over-rustls"] ,optional = true }
 
-tonic = { version = "0.4", features = ["tls"] }
-prost = "0.7"
-futures = { version = "0.3", default-features = false , features=["std"] }
+tonic = { version = "0.5", features = ["tls"] ,optional = true }
+prost = { version = "0.8" , optional = true }
+futures = { version = "0.3", default-features = false , features=["std"] ,optional = true }
+
 sha2 = "0.9"
 hex = "0.4"
 
 [build-dependencies]
-tonic-build = { version = "0.4", features = ["prost"] }
+tonic-build = { version = "0.5", features = ["prost"] ,optional = true }
 
 [[bin]]
 name = "trojan-lite-server"
